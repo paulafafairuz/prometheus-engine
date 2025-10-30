@@ -112,7 +112,7 @@ release-lib::idemp::clone() {
 			popd
 		fi
 	else
-		if ! release-lib::confirm "The repository clone on ${clone_dir} exists. Do you want to reuse this directory? 'n' will attempt a hard reset on the repo (quicker then re-clone)."; then
+		if ! release-lib::confirm "The repository clone on ${clone_dir} exists. Do you want to reuse this directory without resetting? 'n' will attempt a hard reset on the repo (quicker then re-clone)."; then
 			git checkout "${source_branch}"
 			git reset --hard "origin/${source_branch}"
 			git branch --merged | grep -v "\*|${source_branch}" | xargs git branch -D
@@ -181,11 +181,24 @@ release-lib::idemp::vulnlist() {
 		return 1
 	fi
 
-	if [[ ! -f "${vuln_file}" || -z $(cat "${vuln_file}") ]]; then
-		release-lib::vulnlist "${dir}" "${vuln_file}"
+	if [[ -f "${vuln_file}" && ! -z $(cat "${vuln_file}") ]]; then
+		if ! release-lib::confirm "Found previous "${vuln_file}". Do you want to reuse this file? 'n' will re-run Go vulnlist check."; then
+			release-lib::vulnlist "${dir}" "${vuln_file}"
+		else
+			echo "⚠️ Using existing ${vuln_file}"
+		fi
 	else
-		echo "⚠️ Using existing ${vuln_file}"
+		release-lib::vulnlist "${dir}" "${vuln_file}"
 	fi
+}
+
+release-lib::dockerfiles() {
+	local dir="${1}"
+	if [[ -z "${dir}" ]]; then
+		echo "❌  dir arg is required." >&2
+		return 1
+	fi
+	find "${dir}" -name "Dockerfile" | grep -v "/third_party/" | grep -v "/examples/" | grep -v "/hack/"
 }
 
 release-lib::vulnlist() {
@@ -204,12 +217,22 @@ release-lib::vulnlist() {
 		return 1
 	fi
 
-	echo "🔄 Detecting Go vulnerabilities to fix..."
-	# TODO(bwplotka): Capture correct Go version.
-	# TODO(bwplotka): api.text is useful, document how to obtain it.
+	readarray -t DOCKERFILES < <(release-lib::dockerfiles "${DIR}")
+	local go_version=$(release-lib::dockerfile_go_version "${DOCKERFILES[0]}")
+	if [[ -z "${go_version}" ]]; then
+		echo "❌  can't find any golang image in ${DOCKERFILES[0]}" >&2
+		return 1
+	fi
+
+	echo "🔄  Detecting Go ${go_version} vulnerabilities to fix..."
 	pushd "${SCRIPT_DIR}/vulnupdatelist/"
+	if [[ ! -f "./api.text" ]]; then
+		echo "❌  $(pwd)/api.text file not found in your filesystem. Please create it with your NVD API key. See https://nvd.nist.gov/developers/request-an-api-key" >&2
+		return 1
+	fi
+
 	go run "./..." \
-		-go-version=1.23.4 \
+		-go-version=${go_version} \
 		-only-fixed \
 		-dir="${dir}" \
 		-nvd-api-key="$(cat "./api.text")" | tee "${vuln_file}"
@@ -372,4 +395,231 @@ ${to_exclude}
 "
 	git restore .
 	git clean -fd
+}
+
+release-lib::idemp::dockerfile_update_go_version() {
+	local dockerfile=${1}
+	if [[ -z "${dockerfile}" ]]; then
+		echo "❌  dir arg is required." >&2
+		return 1
+	fi
+
+	if [ ! -f "${dockerfile}" ]; then
+		echo "❌ File not found: $DOCKERFILE"
+		return 1
+	fi
+
+	# TODO test if dockerfile without Go image will fail as expected.
+	local go_version=$(release-lib::dockerfile_go_version "${dockerfile}")
+
+	local golang_tags=$(go tool gcrane ls "google-go.pkg.dev/golang" --json | jq --raw-output '.tags[]' | sort -V)
+	if [[ -z "${INCLUDE_RC:-}" ]]; then
+		golang_tags=$(echo "${golang_tags}" | grep -v "rc.*")
+	fi
+	if [[ -n "${LATEST_MINOR:-}" ]]; then
+		golang_tags=$(echo "${golang_tags}" | grep "${LATEST_MINOR}.*")
+	fi
+	local latest_golang_tag=$(echo "${golang_tags}" | tail -n1)
+	if [[ "${go_version}" == "${latest_golang_tag}" ]]; then
+		echo "✅  Nothing to do; ${dockerfile} already uses ${go_version}"
+		return 0
+	fi
+
+	# Upgrade.
+	local latest_golang_digest=$(crane digest "google-go.pkg.dev/golang:${latest_golang_tag}")
+	local latest_golang_image="google-go.pkg.dev/golang:${latest_golang_tag}@${latest_golang_digest}"
+	echo "🔄  Ensuring ${latest_golang_image} on ${dockerfile}..."
+	if ! gsed -i -E "s#google-go\.pkg\.dev/golang:([0-9]+\.[0-9]+\.[0-9+][^@ ]*)?(@sha256:[0-9a-f]+)?#${latest_golang_image}#g" "${dockerfile}"; then
+		echo "❌  sed didn't replace?"
+		return 1
+	fi
+
+	echo "✅  Done!"
+	return 0
+}
+
+release-lib::dockerfile_go_version() {
+	local dockerfile=${1}
+	if [[ -z "${dockerfile}" ]]; then
+		echo "❌  dir arg is required." >&2
+		return 1
+	fi
+
+	if [ ! -f "${dockerfile}" ]; then
+		echo "❌ File not found: $DOCKERFILE"
+		return 1
+	fi
+
+	# 1. Find all 'FROM' lines.
+	# 2. Use sed to:
+	#    - Remove the 'FROM ' prefix.
+	#    - Remove the optional '--platform=[...]' flag.
+	#    - Remove the optional 'AS [...]' stage name at the end of the line.
+	# 3. Read each resulting full image string line by line.
+	local go_tag=$(grep '^FROM ' "${dockerfile}" |
+		sed -e 's/^FROM //' \
+			-e 's/--platform=[^ ]* //' \
+			-e 's/ AS [^ ]*$//' |
+		while read -r full_image_string; do
+			# Initialize variables for each line
+			image_name=""
+			tag=""
+			sha=""
+
+			# --- 1. Extract SHA ---
+			# Check if the string contains a SHA digest (delimited by '@')
+			if [[ "$full_image_string" == *@* ]]; then
+				# Use cut to split the string at the '@'
+				image_and_tag=$(echo "$full_image_string" | cut -d'@' -f1)
+				sha=$(echo "$full_image_string" | cut -d'@' -f2)
+			else
+				# No SHA found
+				image_and_tag="$full_image_string"
+				sha="<none>"
+			fi
+
+			# --- 2. Extract Tag ---
+			# A tag is the part after the *last* colon.
+			# We must check that this part doesn't contain a '/',
+			# which would mean it's part of a port number (e.g., localhost:5000/my-image)
+
+			# Get the part after the last colon
+			last_part="${image_and_tag##*:}"
+
+			if [[ "$last_part" == "$image_and_tag" || "$last_part" == */* ]]; then
+				# Case 1: No colon found (e.g., "alpine")
+				#    Here, last_part == image_and_tag
+				# Case 2: Colon is part of a port/path (e.g., "my.registry:5000/image")
+				#    Here, last_part == "5000/image", which matches */*
+				image_name="$image_and_tag"
+				tag="<none>"
+			else
+				# Case 3: A valid tag was found (e.g., "alpine:latest")
+				#    Here, last_part == "latest"
+				image_name="${image_and_tag%:*}"
+				tag="$last_part"
+			fi
+
+			if [[ "${image_name}" == "google-go.pkg.dev/golang" ]]; then
+				go_tag="${tag}"
+				echo "${go_tag}"
+				break
+			fi
+		done)
+
+	if [[ -z "${go_tag}" ]]; then
+		echo "❌ Could not find golang image in Dockerfile: ${dockerfile}"
+		return 1
+	fi
+
+	echo "${go_tag}"
+	return 0
+}
+
+release-lib::idemp::manifests_bash_image_bump() {
+	local dir=${1}
+	if [[ -z "${dir}" ]]; then
+		echo "❌  dir arg is required." >&2
+		return 1
+	fi
+
+	local values_file="${dir}/charts/values.global.yaml"
+	# TODO: Not enough, this has to check actual manifests.
+	local bash_tag=$(go tool yq '.images.bash.tag' "${values_file}")
+
+	local latest_bash_tag=$(go tool gcrane ls "gke.gcr.io/gke-distroless/bash" --json | jq --raw-output '.tags[]' | grep "gke_distroless_" | sort -V | tail -n1)
+	if [[ "${bash_tag}" == "${latest_bash_tag}" ]]; then
+		echo "✅  Nothing to do; ${values_file} already uses ${latest_bash_tag}"
+		return 0
+	fi
+
+	# Upgrade.
+	echo "🔄  Ensuring ${latest_bash_tag} on ${values_file}..."
+	if ! gsed -i -E "s#tag: ${bash_tag}#tag: ${latest_bash_tag}#g" "${values_file}"; then
+		# TODO: This is flaky, no failing actually on no match. Common bug is
+		echo "❌  sed didn't replace?"
+		return 1
+	fi
+
+	# Regen only what's needed.
+	release-lib::manifests_regen "${dir}"
+	echo "✅  Done!"
+	return 0
+}
+
+release-lib::manifests_regen() {
+	local dir=${1}
+	if [[ -z "${dir}" ]]; then
+		echo "❌  dir arg is required." >&2
+		return 1
+	fi
+
+	source "${dir}/.bingo/variables.env"
+	YQ="${YQ:-}" HELM="${HELM}" ADDLICENSE="${ADDLICENSE:-}" bash "${dir}/hack/presubmit.sh" manifests
+	echo "✅  Manifests regenerated"
+	return 0
+}
+
+# Accepts "FORCE_NEW_PATCH_VERSION"
+release-lib::next_release_tag() {
+	local dir=${1}
+	if [[ -z "${dir}" ]]; then
+		echo "❌  dir arg is required." >&2
+		return 1
+	fi
+
+	pushd "${dir}"
+
+	# Get the latest tag from the current branch's history
+	# `git describe --tags --abbrev=0` finds the closest tag in the ancestry.
+	local LATEST_TAG=""
+	if ! LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null); then
+		echo "❌ Error: No reachable tags found on this branch's history." >&2
+		echo "Please ensure you have tags and have fetched them." >&2
+		return 1
+	fi
+
+	# Apply bumping logic
+	NEW_TAG=""
+	if [[ "${LATEST_TAG}" == *"-rc."* && -z "${FORCE_NEW_PATCH_VERSION:-}" ]]; then
+		# Get the part before "-rc." (e.g., "v1.2.3")
+		BASE_VERSION="${LATEST_TAG%-rc.*}"
+		# Get the part after "-rc." (e.g., "4")
+		RC_NUMBER="${LATEST_TAG##*-rc.}"
+		# Increment the RC number
+		NEW_RC_NUMBER=$((RC_NUMBER + 1))
+
+		NEW_TAG="${BASE_VERSION}-rc.${NEW_RC_NUMBER}"
+	else
+		# Preserve the 'v' prefix if it exists
+		PREFIX=""
+		if [[ "$LATEST_TAG" == v* ]]; then
+			PREFIX="v"
+		fi
+		# Remove 'v' prefix for parsing (e.g., "1.2.3")
+		VERSION_ONLY="${LATEST_TAG#v}"
+		# Remove rc suffix, if exists.
+		VERSION_ONLY="${VERSION_ONLY%-rc.*}"
+
+		# Read major, minor, and patch into variables
+		# We use a default of 0 for missing components
+		IFS='.' read -r major minor patch <<<"$VERSION_ONLY"
+		major=${major:-0}
+		minor=${minor:-0}
+		patch=${patch:-0}
+
+		# Check that the patch version is a valid number
+		if ! [[ "$patch" =~ ^[0-9]+$ ]]; then
+			echo "❌ Error: Latest tag '$LATEST_TAG' does not have a numeric patch version (x.y.Z)." >&2
+			return 1
+		fi
+		# Increment the patch number
+		NEW_PATCH=$((patch + 1))
+		NEW_TAG="${PREFIX}${major}.${minor}.${NEW_PATCH}-rc.0"
+	fi
+
+	popd
+
+	echo "${NEW_TAG}"
+	return 0
 }

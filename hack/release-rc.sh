@@ -46,8 +46,9 @@ Example use:
 
 Variables:
 * BRANCH (required) - Release branch to work on; Project is auto-detected from this.
-* TAG (required) - Tag to release.
 * CHECKOUT_DIR (required) - Local working directory e.g. for local clones.
+* TAG (optional) - Tag to release. If empty next tag version will be detected (double check this!)
+* FORCE_NEW_PATCH_VERSION (optional) - If not empty, forces a new patch version as a new TAG (if TAG is empty).
 _EOM
 }
 
@@ -83,23 +84,22 @@ if [[ -z "${CHECKOUT_DIR}" ]]; then
 	exit 1
 fi
 
-# TODO(bwplotka): Auto-detect this.
-if [[ -z "${TAG}" ]]; then
-	echo "❌  TAG environment variable is not set." >&2
-	usage
-	exit 1
-fi
-
 DIR="${CHECKOUT_DIR}/${PROJECT}"
 release-lib::idemp::clone "${DIR}" "${BRANCH}" "${PR_BRANCH}"
 
 pushd "${DIR}"
 
+if [[ -z "${TAG:-}" ]]; then
+	TAG=$(release-lib::next_release_tag "${DIR}")
+	echo "✅  Detected next release tag: ${TAG}"
+fi
+
 if [[ "${PROJECT}" == "prometheus-engine" ]]; then
 	pushd "${SCRIPT_DIR}"
+	# TODO: This is not doing a lot, move to bash
 	go run "./prepare_rc" -dir "${DIR}" -tag "${TAG}"
 	popd
-	"${DIR}/hack/presubmit.sh" manifests
+	release-lib::manifests_regen "${dir}"
 	git add --all
 else
 	# Prometheus and Alertmanager fork needs just a correct version in the VERSION file,
@@ -107,6 +107,10 @@ else
 	temp=${TAG#v} # Remove v and then -rc.* suffix.
 	echo "${temp%-rc.*}" >VERSION
 	git add VERSION
+fi
+
+if release-lib::confirm "About to create a local git tag for ${TAG} in ${DIR} on ${PR_BRANCH}; should I continue?"; then
+	exit 1
 fi
 
 # Commit if anything is staged.
